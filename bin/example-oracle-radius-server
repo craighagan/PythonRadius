@@ -1,0 +1,168 @@
+#! /apollo/sbin/envroot "$ENVROOT/bin/python2.7"
+# *-*-python-*-*
+#
+# this is implemented using the threading server
+# performance could be impaired by threads contending around a global lock
+# since most of the time should be spent waiting on the network, this shouldn't
+# be an issue. I've benched this against a pure serial server and it is substantually better.
+#
+# if threaded server is insufficient, the multiprocess model should be better
+# an example can be found here: https://gist.github.com/micktwomey/606178
+#
+
+
+import time
+import socket                                      
+import SocketServer
+import threading
+import os
+import logging
+import datetime
+
+from awssecrets import *
+from radiusmessage import *
+from radiususermapper import *
+from radiussecrets import *
+from radiusconstants import *
+from radiusauthenticator import *
+
+#get this from command line
+server = "0.0.0.0" # listen on all ips
+port =  1812
+
+packet_debug = False
+
+if port is None:
+    port = 1812
+else:
+    port = int(port)
+
+
+    
+LOGDIR =  "/tmp"
+LOGFILE = LOGDIR + "/oracle-radius-proxy.log"
+    
+if not os.path.exists(LOGDIR):
+    os.makedirs(LOGDIR)
+                        
+log = None
+logging.getLogger('boto').setLevel(logging.WARNING)
+
+def initialize_logging():
+    if log == None:
+        #logging.initLogging(filename_base=LOGFILE, suffix_format="%Y-%m-%d", utc=True)
+        logging.getLogger("oracle-radius-server").setLevel(logging.INFO)
+        return logging.getLogger("oracle-radius-server")
+
+log = initialize_logging()
+
+
+
+user_authenticator = GoogleAuthSQLite('/tmp/users.db')
+
+
+
+client_secret_server = ClientRadiusSecretsSQLite('/tmp/hosts.db')
+    
+oracle_user_mapper = OracleUserMapper()
+        
+class MyUDPHandler(SocketServer.BaseRequestHandler):
+
+    def handle(self):
+
+        start_time = time.time()
+        data = self.request[0].strip()
+        cur_thread = threading.current_thread()
+        sock = self.request[1]
+        addr = self.client_address
+
+        log.info("thread-%r client %s" % (cur_thread,addr[0]))
+
+        try:
+            request = RadiusRequest(datagram=data)
+        except ValueError:
+            log.warn("bad packet from client %s, dropping" %(addr[0]))
+            return
+
+        if packet_debug:
+            print "receive from client",request
+
+        client_secret = client_secret_server.getSecret(addr[0])
+
+        if request.isHealthCheckRequest():
+            client_secret = 'healthcheck'
+
+        elif client_secret is None:
+            log.error("request from client %s, no secret found in secret store, dropping" % (addr[0]))
+            return
+
+        request.secret = client_secret
+
+        attr_hash = request.getAttrHash()
+
+        alternate_username = oracle_user_mapper.transformUsername(request.username)
+        log.info("thread %r client %s remap user from %s to %s" % (cur_thread,addr[0],request.username,alternate_username))
+
+        if packet_debug:
+            print("thread %r client %s remap user from %s to %s" % (cur_thread,addr[0],request.username,alternate_username))
+        
+        if request.isHealthCheckRequest():
+            request.secret='healthcheck'
+            resp = RadiusResponse()
+            resp.secret = request.secret
+            resp.code = RADIUS_ACCT_STATUS
+            resp.setSpecificAttr(RADIUS_PROXY_STATE,'success')            
+        
+            log.info("healthcheck response msg to %s" % repr(addr))
+
+            if packet_debug:
+                print "healthcheck response to client ",resp
+                
+            sock.sendto(resp.getUDPDatagram(),addr)
+
+        elif(request.isAccessRequest()):
+            resp = RadiusResponse()
+            
+            resp.secret = request.secret
+            resp.identifier = request.identifier
+
+            #we could call a function to map a user to an authenticator
+
+            if user_authenticator.authenticateUser(alternate_username,request.password):
+                resp.code = RADIUS_ACCESS_ACCEPT
+            else:
+                resp.code = RADIUS_ACCESS_REJECT
+
+            resp.requestAuthenticator = request.authenticator
+            
+            log.info("response msg to %s" % repr(addr))
+
+            if packet_debug:
+                print "response to client ",resp
+                
+            sock.sendto(resp.getUDPDatagram(),addr)
+            
+        else:
+            log.info("non auth request from %s" % repr(addr))
+
+
+        end_time = time.time()
+        delta_time = (end_time-start_time)*1000
+
+
+class ThreadedUDPServer(SocketServer.ThreadingMixIn, SocketServer.UDPServer):
+    pass
+
+
+if __name__ == "__main__":
+
+    logging.info("start server on (%s:%d)" % (server,port))
+        
+    server = ThreadedUDPServer((server, port), MyUDPHandler)
+
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.daemon = True
+    server_thread.start()
+    
+    while True:
+        server_thread.join()
